@@ -1,0 +1,143 @@
+#!/usr/local/bin/python
+
+# A sample training component that trains a simple scikit-learn model with optuna.
+# This implementation works in File mode and makes no assumptions about the input file names.
+# Input is specified as CSV with a data point in each row and the labels in the first column.
+
+from __future__ import print_function
+
+import os
+import sys
+import json
+import pickle
+import traceback
+import subprocess
+
+import pandas as pd
+
+from tpot import TPOTClassifier
+from sklearn.model_selection import train_test_split
+
+# These are the paths to where SageMaker mounts interesting things in your container.
+
+prefix = '/opt/ml'
+
+input_path = os.path.join(prefix, 'input/data')
+output_path = os.path.join(prefix, 'output')
+model_path = os.path.join(prefix, 'model')
+param_path = os.path.join(prefix, 'input/config/hyperparameters.json')
+
+# This algorithm has a single channel of input data called 'training'. Since we run in
+# File mode, the input files are copied to the directory specified here.
+channel_name = 'training'
+training_path = os.path.join(input_path, channel_name) # /opt/ml/input/data/training
+
+file_name = 'pipeline.py'
+text = 'with open(\'{}/optimized.pkl\', \'wb\') as out:\n    pickle.dump(exported_pipeline, out)\n'.format(model_path)
+
+# The function to modify the exported optimized pipeline code
+def modify_pipeline(file_name):
+    result = "results = "
+    target = "tpot_data ="
+    target2 = "features = "
+    target3 = "train_test_split(features"
+    target4 = "exported_pipeline.fit("
+    target_library = "import numpy"
+    replace = "tpot_data = pd.read_csv('{}/iris.csv', sep='{}', dtype=np.float64, header=None)\n".format(training_path, ',')
+    replace2 = "X = tpot_data.iloc[:, :-1]\ny = tpot_data.iloc[:, [-1]]\n"
+    replace3 = "    train_test_split(X, y, test_size=0.2, random_state=39)\n"
+    replace4 = "exported_pipeline.fit(training_features, training_target.values.ravel())\n"
+    replace_library = "import numpy as np\nimport pickle\n"
+    tmp_list = []
+    with open(file_name, 'r') as tmp:
+        for row in tmp:
+            if row.find(target) != -1:
+                tmp_list.append(replace)
+            elif row.find(target2) != -1:
+                tmp_list.append(replace2)
+            elif row.find(target3) != -1:
+                tmp_list.append(replace3)
+            elif row.find(target4) != -1:
+                tmp_list.append(replace4)
+            elif row.find(target_library) != -1:
+                tmp_list.append(replace_library)
+            elif row.find(result) != -1:
+                tmp_list.append(text)
+            else:
+                tmp_list.append(row)
+    with open(file_name, 'w') as tmp:
+        for row in range(len(tmp_list)):
+            tmp.write(tmp_list[row])
+
+# The function to execute the training.
+def train():
+    print('Starting the training.')
+    try:
+        # Read in any parameters that the user passed for Optuna
+        with open(param_path, 'r') as tc:
+            params = json.load(tc)
+
+        # Take the set of files and read all into a single pandas dataframe
+        input_files = [os.path.join(training_path, file) for file in os.listdir(training_path)]
+        if len(input_files) == 0:
+            raise ValueError(('There are no files in {}.\n' +
+                              'This usually indicates that the channel ({}) was incorrectly specified,\n' +
+                              'the data specification in S3 was incorrectly specified or the role specified\n' +
+                              'does not have permission to access the data.').format(training_path, channel_name))
+        raw_data = [pd.read_csv(file, header=None) for file in input_files]
+        train_data = pd.concat(raw_data)
+
+        # Note that parameters are always passed in as strings, so we need to do any necessary conversions.
+        generations = params.get('generations', None)
+        if generations is not None:
+            generations = int(generations)
+        else:
+            generations = 100 # default generations value
+        populations = params.get('populations', None)
+        if populations is not None:
+            populations = int(populations)
+        else:
+            polulations = 100 # default population value
+        cv = params.get('cv', None)
+        if cv is not None:
+            cv = int(cv)
+        else:
+            cv = 5 # default cv value
+
+        # labels are at the last column
+        X = train_data.iloc[:, :-1]
+        y = train_data.iloc[:, [-1]]
+        print('X shape: (%i,%i)' % X.shape)
+        print('y shape: (%i,%i)' % y.shape)
+
+        # train and test split with validate data
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=39)
+        pipeline_optimizer = TPOTClassifier(generations=generations, population_size=populations, cv=cv, random_state=39, verbosity=2)
+        pipeline_optimizer.fit(X_train, y_train.values.ravel())
+        pipeline_optimizer.export(file_name)
+        modify_pipeline(file_name)
+        print("TPOT Accuracy score: {}".format(pipeline_optimizer.score(X_test, y_test.values.ravel())))
+        print(pipeline_optimizer)
+
+        # execute the exported optimized pipeline and create a model
+        subprocess.run(['python', file_name])
+        print('Training completed.')
+
+    except Exception as e:
+        # Write out an error file. This will be returned as the failureReason in the
+        # DescribeTrainingJob result.
+        trc = traceback.format_exc()
+        with open(os.path.join(output_path, 'failure'), 'w') as s:
+            s.write('Exception during training: ' + str(e) + '\n' + trc)
+        # Printing this causes the exception to be in the training job logs, as well.
+        print('Exception during training: ' + str(e) + '\n' + trc, file=sys.stderr)
+        # A non-zero exit code causes the training job to be marked as Failed.
+        sys.exit(255)
+
+if __name__ == '__main__':
+    # train execution
+    train()
+
+    # A zero exit code causes the job to be marked as Succeeded.
+    sys.exit(0)
+
